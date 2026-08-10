@@ -1,0 +1,82 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* shadcn/ui-convention variables (raw HSL triplets, no hsl() wrapper --
+       tailwind.config.js wraps them). Computed directly from the same hex
+       values used elsewhere in this file, not eyeballed separately, so the
+       two token systems can never silently drift apart. */
+    --background: 217.5 28.6% 5.5%;      /* #0A0D12 -- void */
+    --foreground: 213.3 24.3% 92.7%;     /* #E8ECF1 -- ink-primary */
+    --card: 216.9 26.5% 9.6%;            /* #12171F -- surface */
+    --popover: 216.9 26.5% 9.6%;
+    --border: 217.1 23.1% 17.8%;         /* #232B38 -- line */
+    --input: 217.1 23.1% 17.8%;
+    --primary: 201.6 100.0% 34.9%;       /* #0072B2 -- Okabe-Ito C */
+    --primary-foreground: 217.5 28.6% 5.5%;
+    --secondary: 216.7 25.7% 13.7%;      /* #1A212C -- surface-raised */
+    --accent: 216.7 25.7% 13.7%;
+    --muted: 216.9 26.5% 9.6%;
+    --muted-foreground: 215.6 11.5% 53.9%; /* #7C8797 -- ink-muted */
+    --destructive: 326.7 44.9% 63.7%;    /* #CC79A7 -- Okabe-Ito T */
+    --destructive-foreground: 217.5 28.6% 5.5%;
+    --ring: 201.6 100.0% 34.9%;
+  }
+
+  * {
+    @apply border-line;
+  }
+
+  body {
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+  }
+
+  /* Visible keyboard focus everywhere -- never remove without a replacement. */
+  :focus-visible {
+    outline: 2px solid #0072b2;
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background-color: rgba(0, 114, 178, 0.35);
+  }
+
+  /* Thin, quiet scrollbars that fit the instrument-panel aesthetic instead
+     of the browser default, without becoming a distraction of their own. */
+  ::-webkit-scrollbar {
+    height: 8px;
+    width: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #12171f;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2a3341;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #384252;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

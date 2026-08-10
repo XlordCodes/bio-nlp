@@ -1,0 +1,5 @@
+training_pairs.jsonl
+latest.training_state.pt
+checkpoints/
+data/training_pairs.jsonl
+*.jsonl
