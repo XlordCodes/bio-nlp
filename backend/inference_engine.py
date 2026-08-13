@@ -42,7 +42,7 @@ from typing import List, Optional, Tuple, Union
 import edlib  # type: ignore
 import torch
 import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler 
+from torch.amp.grad_scaler import GradScaler  # type: ignore
 
 from config import (
     DEFAULT_INFERENCE_CHUNK_SIZE,
@@ -134,7 +134,7 @@ class InferenceEngine:
     # -- per-chunk inference --------------------------------------------------
 
     @torch.no_grad()
-    def _correct_chunk(self, chunk_seq: str) -> Tuple[str, List[List[float]], List[float]]:
+    def _correct_chunk(self, chunk_seq: str) -> Tuple[str, List[List[float]], List[float], bool]:
         tensors = self.tokenizer.encode_to_tensors(chunk_seq)
         src_tokens = tensors["token_ids"].unsqueeze(0).to(self.device)
         src_lengths = tensors["length"].unsqueeze(0).to(self.device)
@@ -155,12 +155,14 @@ class InferenceEngine:
         )
 
         predicted_tokens = output.predicted_tokens[0].tolist()
-        if EOS_IDX not in predicted_tokens:
-            print(
-                f"WARNING: decoder did not emit <EOS> within max_decode_len={max_decode_len} "
-                f"for a {len(chunk_seq)}-base chunk; output may be truncated. Consider "
-                f"increasing decode_length_margin."
-            )
+        eos_emitted = EOS_IDX in predicted_tokens
+        # NOTE: no per-chunk print here -- on a real evaluation run this can
+        # fire on a meaningful fraction of chunks (expected, especially on an
+        # early-training checkpoint), and printing once per chunk floods the
+        # log without being any more actionable. See correct_sequence()'s
+        # aggregate NOTE line, and training/evaluate.py's summary, which
+        # report the RATE across a run instead -- the number actually worth
+        # watching.
 
         # Per-step confidence: the probability the model assigned to the
         # token it actually chose at each decode step (max softmax prob).
@@ -173,7 +175,7 @@ class InferenceEngine:
             predicted_tokens, step_confidences
         )
         attention_matrix = output.attention_matrix[0].detach().cpu().tolist()
-        return corrected_chunk, attention_matrix, confidences
+        return corrected_chunk, attention_matrix, confidences, eos_emitted
 
     # -- stitching --------------------------------------------------------------
 
@@ -330,13 +332,24 @@ class InferenceEngine:
         corrected_chunks: List[str] = []
         attention_matrices: List[List[List[float]]] = []
         confidence_chunks: List[List[float]] = []
+        chunks_without_eos = 0
         for chunk_start, chunk_end in offsets:
-            corrected_chunk, attention_matrix, confidences = self._correct_chunk(
+            corrected_chunk, attention_matrix, confidences, eos_emitted = self._correct_chunk(
                 sequence[chunk_start:chunk_end]
             )
             corrected_chunks.append(corrected_chunk)
             attention_matrices.append(attention_matrix)
             confidence_chunks.append(confidences)
+            if not eos_emitted:
+                chunks_without_eos += 1
+
+        if chunks_without_eos > 0:
+            print(
+                f"NOTE: {chunks_without_eos}/{len(offsets)} chunk(s) in this sequence did not emit "
+                f"<EOS> within their decode budget; those chunks' output may be truncated/degraded. "
+                f"Consider increasing decode_length_margin, or note this is expected on an "
+                f"early-training checkpoint."
+            )
 
         stitched_result = self._stitch_chunks(
             offsets, corrected_chunks, confidence_chunks
@@ -346,6 +359,7 @@ class InferenceEngine:
 
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         metrics = self._compute_metrics(sequence, final_sequence, len(offsets), latency_ms)
+        metrics["chunks_without_eos"] = chunks_without_eos
         
         attention_chunks = [
             {
@@ -420,7 +434,7 @@ def save_checkpoint(model: SequenceTranslationModel, checkpoint_path: str) -> No
     into place (os.replace/Path.replace are atomic on POSIX, which is what
     Kaggle/Colab run on). This matters specifically because Kaggle's 12-hour
     session limit is a hard kill, not a graceful shutdown -- without this, a
-    kill mid-write could leave a truncated, unloadable checkpoint file behind
+    kill mid-write could leave a truncated, unloadable  checkpoint file behind
     with no warning until the next session tries to load it.
     """
     path = Path(checkpoint_path)

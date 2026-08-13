@@ -96,6 +96,20 @@ def run_evaluation(
     frame_preserved_flags = [r["frame"]["global_frame_preserved"] for r in per_example_results]
     frame_intact_fractions = [r["frame"]["frame_intact_fraction"] for r in per_example_results]
 
+    # How often the decoder failed to terminate naturally (no <EOS> within
+    # its decode budget) across the whole run -- a genuine free-running
+    # quality signal (see InferenceEngine.correct_sequence(), which tracks
+    # this per chunk instead of printing a warning per occurrence). Chunks
+    # that don't terminate naturally tend to drift/degrade for their
+    # remaining budget, which inflates edit_distance/depresses identity for
+    # those specific examples -- report the rate so it's visible as a real
+    # number instead of buried in per-example noise.
+    total_chunks = sum(r["operational_metrics"]["num_chunks"] for r in per_example_results)
+    total_chunks_without_eos = sum(r["operational_metrics"]["chunks_without_eos"] for r in per_example_results)
+    examples_with_any_truncation = sum(
+        1 for r in per_example_results if r["operational_metrics"]["chunks_without_eos"] > 0
+    )
+
     summary = {
         "num_examples": len(per_example_results),
         "mean_identity": statistics.mean(identities) if identities else float("nan"),
@@ -105,6 +119,14 @@ def run_evaluation(
         ),
         "mean_frame_intact_fraction": (
             statistics.mean(frame_intact_fractions) if frame_intact_fractions else float("nan")
+        ),
+        "total_chunks": total_chunks,
+        "total_chunks_without_eos": total_chunks_without_eos,
+        "fraction_chunks_without_eos": (
+            total_chunks_without_eos / total_chunks if total_chunks > 0 else float("nan")
+        ),
+        "fraction_examples_with_any_truncation": (
+            examples_with_any_truncation / len(per_example_results) if per_example_results else float("nan")
         ),
     }
 
@@ -133,6 +155,17 @@ def run_evaluation(
     for k, v in summary.items():
         if k != "num_examples":
             print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+    if summary["fraction_chunks_without_eos"] > 0.05:
+        print(
+            f"\nNOTE: {summary['fraction_chunks_without_eos']:.1%} of chunks across this run did not "
+            f"terminate naturally (no <EOS> within decode budget). This is a genuine free-running-quality "
+            f"signal, not just log noise -- affected examples' identity/edit_distance are likely pessimistic "
+            f"underestimates of true correction quality, since a truncated-without-stopping tail tends to "
+            f"drift/degrade rather than cleanly end. Common on an early-training checkpoint (val_loss is "
+            f"measured under full teacher forcing and never scores the model on deciding when to stop); "
+            f"expect this fraction to drop as training progresses further."
+        )
 
     return summary
 
@@ -243,6 +276,7 @@ if __name__ == "__main__":
         assert summary["num_examples"] == 3
         assert 0.0 <= summary["mean_identity"] <= 1.0
         assert 0.0 <= summary["fraction_frame_preserved"] <= 1.0
+        assert 0.0 <= summary["fraction_chunks_without_eos"] <= 1.0
         print(f"\n[1/3] run_evaluation() produced a well-formed summary: {summary}")
 
         fasta_path = Path(output_dir) / "evaluation_outputs.fasta"
