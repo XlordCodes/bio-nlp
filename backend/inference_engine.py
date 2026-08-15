@@ -43,6 +43,7 @@ import edlib  # type: ignore
 import torch
 import torch.nn.functional as F
 from torch.amp.grad_scaler import GradScaler  # type: ignore
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from config import (
     DEFAULT_INFERENCE_CHUNK_SIZE,
@@ -452,6 +453,7 @@ def save_training_state(
     best_val_loss: float,
     path: str,
     scaler: Optional[GradScaler] = None,
+    scheduler: Optional[ReduceLROnPlateau] = None,
 ) -> None:
     """
     Full training-resume checkpoint: model weights + optimizer state (Adam's
@@ -490,6 +492,8 @@ def save_training_state(
     }
     if scaler is not None:
         state["scaler_state_dict"] = scaler.state_dict()
+    if scheduler is not None:
+        state["scheduler_state_dict"] = scheduler.state_dict()
     torch.save(state, tmp_path)
     tmp_path.replace(out_path)
 
@@ -499,6 +503,7 @@ def load_training_state(
     path: str,
     device: torch.device,
     scaler: Optional[GradScaler] = None,
+    scheduler: Optional[ReduceLROnPlateau] = None,
 ) -> Tuple[int, int, float]:
     """
     Loads a training-resume checkpoint written by save_training_state(),
@@ -520,6 +525,8 @@ def load_training_state(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if scaler is not None and "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     return checkpoint["epoch"], checkpoint["global_step"], checkpoint["best_val_loss"]
 
 
@@ -553,7 +560,7 @@ if __name__ == "__main__":
             "Loaded-checkpoint model produced different output than the original -- "
             "checkpoint round-trip is not faithful."
         )
-    print("[1/5] Checkpoint save/load round-trip passed (identical predictions).")
+    print("[1/6] Checkpoint save/load round-trip passed (identical predictions).")
 
     # -- 2. Single-chunk path (short sequence, no stitching needed) -----------
     short_seq = "".join(random.choice("ACGT") for _ in range(200))
@@ -564,7 +571,7 @@ if __name__ == "__main__":
     assert result["metrics"]["input_length"] == 200
     assert result["metrics"]["num_chunks"] == 1
     print(
-        f"[2/5] Single-chunk path passed. corrected_length={result['metrics']['corrected_length']}, "
+        f"[2/6] Single-chunk path passed. corrected_length={result['metrics']['corrected_length']}, "
         f"edit_distance={result['metrics']['edit_distance']} (untrained model -- large edit "
         f"distance is expected, this only proves the pipeline runs correctly end to end)."
     )
@@ -601,7 +608,7 @@ if __name__ == "__main__":
         )
     assert corr_ends[-1] == len(result["corrected_sequence"])
     print(
-        f"[3/5] Multi-chunk path on a REAL 2000bp E. coli excerpt passed: {len(offsets)} chunks, "
+        f"[3/6] Multi-chunk path on a REAL 2000bp E. coli excerpt passed: {len(offsets)} chunks, "
         f"stitched contributions are contiguous with no gaps or overlaps. "
         f"corrected_length={result['metrics']['corrected_length']}, "
         f"latency_ms={result['metrics']['latency_ms']:.1f}"
@@ -626,7 +633,7 @@ if __name__ == "__main__":
     assert del_metrics["edit_distance"] == 1
     assert del_metrics["num_deletions"] == 1, del_metrics  # corrected is SHORTER than input -> deletion
     assert del_metrics["num_insertions"] == 0, del_metrics
-    print("[4/5] Metrics correctness (identical / substitution / insertion / deletion cases) passed.")
+    print("[4/6] Metrics correctness (identical / substitution / insertion / deletion cases) passed.")
 
     # -- 5. FASTA-upload parsing ------------------------------------------------
     good_fasta = b">read1 some description\nACGT\nACGT\nAC\n"
@@ -644,6 +651,56 @@ if __name__ == "__main__":
             raise AssertionError(f"Expected ValueError for input {bad_fasta!r}")
         except ValueError as e:
             assert expected_substr in str(e), f"Expected '{expected_substr}' in error, got: {e}"
-    print("[5/5] parse_fasta_upload() validation passed.")
+    print("[5/6] parse_fasta_upload() validation passed.")
+    # -- 6. Training-state round trip: model + optimizer + scaler + scheduler --
+    #       Deliberately drives the scheduler through real state changes (an
+    #       actual LR reduction) rather than testing against a fresh,
+    #       default-state scheduler -- a version of this test that never
+    #       forces any real state change would still pass even if
+    #       scheduler_state_dict were silently never saved/restored at all.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_path = str(Path(tmpdir) / "training_state.pt")
 
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        scaler = GradScaler(device="cpu", enabled=False)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-5)
+
+        # Feed it a worsening sequence of "val losses" until patience=1 is
+        # exceeded and it actually reduces the LR -- this is the real,
+        # non-trivial state we're testing survives a round trip.
+        scheduler.step(1.0)  # first call: establishes the baseline "best"
+        scheduler.step(1.1)  # worse -> 1st bad epoch (not yet past patience)
+        scheduler.step(1.2)  # worse -> 2nd bad epoch -> exceeds patience=1 -> LR reduced
+        reduced_lr = optimizer.param_groups[0]["lr"]
+        assert reduced_lr < 1e-3, "Test setup expected the scheduler to have reduced the LR by now"
+
+        save_training_state(
+            model, optimizer, epoch=3, global_step=999, best_val_loss=1.0,
+            path=state_path, scaler=scaler, scheduler=scheduler,
+        )
+
+        # Fresh, independently-constructed objects -- never saw any of the
+        # above. If their state after loading matches the ORIGINAL objects,
+        # that's real proof the round trip works, not coincidence.
+        fresh_optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        fresh_scaler = GradScaler(device="cpu", enabled=False)
+        fresh_scheduler = ReduceLROnPlateau(fresh_optimizer, mode="min", factor=0.5, patience=1, min_lr=1e-5)
+
+        loaded_epoch, loaded_step, loaded_best_val = load_training_state(
+            model, fresh_optimizer, state_path, device=torch.device("cpu"),
+            scaler=fresh_scaler, scheduler=fresh_scheduler,
+        )
+
+        assert loaded_epoch == 3
+        assert loaded_step == 999
+        assert loaded_best_val == 1.0
+        assert fresh_optimizer.param_groups[0]["lr"] == reduced_lr, (
+            "Optimizer state (including the already-reduced LR) must survive a save/load round trip."
+        )
+        assert fresh_scheduler.state_dict() == scheduler.state_dict(), (
+            "Scheduler's internal bookkeeping (best value, bad-epoch/cooldown counters) must "
+            "survive a save/load round trip -- this is exactly the gap this patch closes."
+        )
+    print("[6/6] Training-state round trip (model + optimizer + scaler + scheduler) passed.")
+    
     print("\nAll inference_engine sanity checks passed.")

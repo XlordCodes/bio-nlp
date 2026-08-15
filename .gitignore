@@ -3,3 +3,11 @@ latest.training_state.pt
 checkpoints/
 data/training_pairs.jsonl
 *.jsonl
+node_modules/
+frontend/node_modules/
+project-code.zip
+__pycache__/
+*/__pycache__/
+.pytest_cache/
+node_modules/
+*.log

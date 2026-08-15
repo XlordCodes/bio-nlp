@@ -26,7 +26,10 @@ from typing import List, Optional
 
 import torch
 
-from config import DEFAULT_MODEL_CHECKPOINT_PATH, DEFAULT_INFERENCE_CHUNK_SIZE, DEFAULT_INFERENCE_CHUNK_OVERLAP
+from config import (
+    DEFAULT_MODEL_CHECKPOINT_PATH, DEFAULT_INFERENCE_CHUNK_SIZE,
+    DEFAULT_INFERENCE_CHUNK_OVERLAP, DEFAULT_DECODE_LENGTH_MARGIN,
+)
 from data.dataset import AlignedPair, load_aligned_pairs_from_jsonl
 from backend.inference_engine import InferenceEngine
 from training.metrics import compute_all_metrics
@@ -51,6 +54,7 @@ def run_evaluation(
     run_minimap2: bool = True,
     chunk_size: int = DEFAULT_INFERENCE_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_INFERENCE_CHUNK_OVERLAP,
+    decode_length_margin: int = DEFAULT_DECODE_LENGTH_MARGIN,
     device: Optional[torch.device] = None,
 ) -> dict:
     """
@@ -65,7 +69,7 @@ def run_evaluation(
 
     print(f"Loading checkpoint from {checkpoint_path} ...")
     engine = InferenceEngine.load_from_checkpoint(
-        checkpoint_path, device=device, chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        checkpoint_path, device=device, chunk_size=chunk_size, chunk_overlap=chunk_overlap, decode_length_margin=decode_length_margin
     )
 
     pairs = load_aligned_pairs_from_jsonl(validation_jsonl_path)
@@ -176,6 +180,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-data", required=False, help="JSONL of AlignedPairs to evaluate against.")
     parser.add_argument("--output-dir", default="evaluation_output")
     parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--decode-length-margin", type=int, default=DEFAULT_DECODE_LENGTH_MARGIN)
     parser.add_argument("--no-minimap2", action="store_true", help="Skip the external minimap2 verification step.")
     return parser
 
@@ -194,6 +199,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             max_examples=args.max_examples,
             run_minimap2=not args.no_minimap2,
+            decode_length_margin=args.decode_length_margin,
         )
         sys.exit(0)
 
@@ -270,6 +276,7 @@ if __name__ == "__main__":
             run_minimap2=True,
             chunk_size=150,
             chunk_overlap=32,
+            decode_length_margin=DEFAULT_DECODE_LENGTH_MARGIN,
             device=torch.device("cpu"),
         )
 

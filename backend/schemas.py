@@ -89,7 +89,9 @@ class CorrectionMetrics(BaseModel):
     num_deletions: int = Field(..., description="Bases present in input with no counterpart in corrected_sequence.")
     num_chunks: int = Field(..., description="Number of model inference chunks the input was split into.")
     latency_ms: float = Field(..., description="Wall-clock inference time in milliseconds.")
-
+    chunks_without_eos: int = Field(
+    0, description="Chunks in this sequence whose decoder never emitted <EOS> "
+                   "within its decode budget; output for those chunks may be truncated.")   
 
 class AttentionChunk(BaseModel):
     """

@@ -19,7 +19,7 @@
 # hardware; see docs/BENCHMARKING.md for the exact invocation.
 #
 # Usage:
-#   ./run_comparison.sh <reads.fastq> <target_reference.fasta> <our_checkpoint.pt> <output_dir>
+#   ./run_comparison.sh <reads.fastq> <target_reference.fasta> <our_checkpoint.pt> <output_dir> [genome_size] [medaka_model]
 
 set -euo pipefail
 
@@ -27,6 +27,16 @@ READS="${1:?Usage: $0 <reads.fastq> <target_reference.fasta> <our_checkpoint.pt>
 REFERENCE="${2:?Provide the target reference FASTA -- must match the reads true strain, see config.py}"
 CHECKPOINT="${3:?Provide our trained model checkpoint path}"
 OUTPUT_DIR="${4:?Provide an output directory}"
+GENOME_SIZE="${5:-4.8m}"
+MEDAKA_MODEL="${6:-}"  # optional; run `medaka tools list_models` to pick one matching your
+                        # read chemistry (e.g. R10.4.1 sup). Empty = medaka_consensus's bundled default.
+
+# --- logging: mirror everything below to a timestamped file, not just the terminal ---
+mkdir -p "$OUTPUT_DIR"
+LOG_FILE="$OUTPUT_DIR/run_comparison_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== run_comparison.sh started: $(date) ==="
+echo "Logging to: $LOG_FILE"
 
 for tool in flye racon medaka_consensus assess_assembly assess_homopolymers dnadiff minimap2; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' not found on PATH. See docs/BENCHMARKING.md."; exit 1; }
@@ -39,13 +49,13 @@ THREADS="$(nproc)"
 # Pipeline A: Uncorrected baseline -- assemble raw reads directly, no polishing
 # ---------------------------------------------------------------------------
 echo "=== [A] Uncorrected baseline: Flye on raw reads ==="
-flye --nano-hq "$READS" --out-dir "$OUTPUT_DIR/uncorrected" --threads "$THREADS"
+flye --nano-hq "$READS" --out-dir "$OUTPUT_DIR/uncorrected" --threads "$THREADS" -g "$GENOME_SIZE"
 
 # ---------------------------------------------------------------------------
 # Pipeline B: Standard industry pipeline -- Flye -> Racon (x4) -> Medaka
 # ---------------------------------------------------------------------------
 echo "=== [B] Standard pipeline: Flye -> Racon x4 -> Medaka ==="
-flye --nano-hq "$READS" --out-dir "$OUTPUT_DIR/racon_medaka/flye_draft" --threads "$THREADS"
+flye --nano-hq "$READS" --out-dir "$OUTPUT_DIR/racon_medaka/flye_draft" --threads "$THREADS" -g "$GENOME_SIZE"
 DRAFT="$OUTPUT_DIR/racon_medaka/flye_draft/assembly.fasta"
 
 CURRENT="$DRAFT"
@@ -56,7 +66,11 @@ for i in 1 2 3 4; do
     CURRENT="$OUTPUT_DIR/racon_medaka/racon_round${i}.fasta"
 done
 
-medaka_consensus -i "$READS" -d "$CURRENT" -o "$OUTPUT_DIR/racon_medaka/medaka_out" -t "$THREADS"
+if [ -n "$MEDAKA_MODEL" ]; then
+    medaka_consensus -i "$READS" -d "$CURRENT" -o "$OUTPUT_DIR/racon_medaka/medaka_out" -t "$THREADS" -m "$MEDAKA_MODEL"
+else
+    medaka_consensus -i "$READS" -d "$CURRENT" -o "$OUTPUT_DIR/racon_medaka/medaka_out" -t "$THREADS"
+fi
 RACON_MEDAKA_FINAL="$OUTPUT_DIR/racon_medaka/medaka_out/consensus.fasta"
 
 # ---------------------------------------------------------------------------
@@ -72,7 +86,7 @@ python -m benchmarking.correct_fastq \
     --input "$READS" \
     --output "$OUTPUT_DIR/ours/corrected_reads.fasta"
 
-flye --nano-hq "$OUTPUT_DIR/ours/corrected_reads.fasta" --out-dir "$OUTPUT_DIR/ours/flye_out" --threads "$THREADS"
+flye --nano-hq "$OUTPUT_DIR/ours/corrected_reads.fasta" --out-dir "$OUTPUT_DIR/ours/flye_out" --threads "$THREADS" -g "$GENOME_SIZE"
 OURS_FINAL="$OUTPUT_DIR/ours/flye_out/assembly.fasta"
 
 # ---------------------------------------------------------------------------
@@ -99,3 +113,5 @@ echo ""
 echo "=== Done. Reports are in $OUTPUT_DIR/assessments/ ==="
 echo "Compare each pipeline's *_assess.summary (Q-scores, indel/mismatch breakdown)"
 echo "and *_homopolymers output (homopolymer-specific accuracy -- the RLE-channel claim)."
+echo ""
+echo "=== Full log saved to: $LOG_FILE ==="

@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from config import (
     PAD_IDX,
@@ -44,6 +45,10 @@ from config import (
     DEFAULT_GRAD_CLIP_NORM,
     DEFAULT_TEACHER_FORCING_START,
     DEFAULT_TEACHER_FORCING_END,
+    DEFAULT_TEACHER_FORCING_WARMUP_FRACTION,
+    DEFAULT_LR_SCHEDULER_FACTOR,
+    DEFAULT_LR_SCHEDULER_PATIENCE,
+    DEFAULT_LR_SCHEDULER_MIN_LR,
 )
 from data.dataset import AlignedPair, create_dataloader, load_aligned_pairs_from_jsonl
 from model.sequence_translation_model import SequenceTranslationConfig, SequenceTranslationModel
@@ -64,11 +69,22 @@ def split_aligned_pairs(
     return train_pairs, val_pairs
 
 
-def compute_teacher_forcing_ratio(global_step: int, total_steps: int, start: float, end: float) -> float:
-    """Linear decay from `start` to `end` over the course of training, by global optimizer step."""
+def compute_teacher_forcing_ratio(
+    global_step: int, total_steps: int, start: float, end: float, warmup_fraction: float = 0.0
+) -> float:
+    """
+    Linear decay from `start` to `end`, delayed by `warmup_fraction`: decay
+    doesn't begin until that fraction of total_steps has elapsed, holding at
+    `start` until then. Added after a real run showed decaying from step 0
+    causes exposure-bias instability before the model has had real training.
+    """
     if total_steps <= 0:
         return end
-    progress = min(max(global_step / total_steps, 0.0), 1.0)
+    raw_progress = min(max(global_step / total_steps, 0.0), 1.0)
+    if raw_progress <= warmup_fraction:
+        return start
+    remaining_span = max(1.0 - warmup_fraction, 1e-8)
+    progress = (raw_progress - warmup_fraction) / remaining_span
     return start + (end - start) * progress
 
 
@@ -126,6 +142,10 @@ def train(
     max_chunk_size: Optional[int] = None,
     teacher_forcing_start: float = DEFAULT_TEACHER_FORCING_START,
     teacher_forcing_end: float = DEFAULT_TEACHER_FORCING_END,
+    teacher_forcing_warmup_fraction: float = DEFAULT_TEACHER_FORCING_WARMUP_FRACTION,
+    lr_scheduler_factor: float = DEFAULT_LR_SCHEDULER_FACTOR,
+    lr_scheduler_patience: int = DEFAULT_LR_SCHEDULER_PATIENCE,
+    lr_scheduler_min_lr: float = DEFAULT_LR_SCHEDULER_MIN_LR,
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     checkpoint_path: str = DEFAULT_MODEL_CHECKPOINT_PATH,
     device: Optional[torch.device] = None,
@@ -263,6 +283,10 @@ def train(
     model = SequenceTranslationModel(SequenceTranslationConfig()).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="min", factor=lr_scheduler_factor,
+        patience=lr_scheduler_patience, min_lr=lr_scheduler_min_lr,
+    )
     loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     scaler = GradScaler(device=device.type, enabled=use_amp)
 
@@ -312,7 +336,8 @@ def train(
 
             step_start = time.perf_counter()
             teacher_forcing_ratio = compute_teacher_forcing_ratio(
-                global_step, total_steps, teacher_forcing_start, teacher_forcing_end
+                global_step, total_steps, teacher_forcing_start, teacher_forcing_end,
+                warmup_fraction=teacher_forcing_warmup_fraction,
             )
 
             with autocast(device_type=device.type, enabled=use_amp):
@@ -343,13 +368,15 @@ def train(
 
             if checkpoint_every_steps and global_step % checkpoint_every_steps == 0:
                 save_training_state(
-                    model, optimizer, epoch, global_step, best_val_loss, training_state_path, scaler=scaler
+                    model, optimizer, epoch, global_step, best_val_loss, training_state_path,
+                    scaler=scaler, scheduler=scheduler,
                 )
 
             elapsed = time.perf_counter() - run_start_time
             if max_wall_time_seconds is not None and elapsed >= (max_wall_time_seconds - safety_margin_seconds):
                 save_training_state(
-                    model, optimizer, epoch, global_step, best_val_loss, training_state_path, scaler=scaler
+                    model, optimizer, epoch, global_step, best_val_loss, training_state_path,
+                    scaler=scaler, scheduler=scheduler,
                 )
                 avg_loss = running_loss / running_batches if running_batches > 0 else float("nan")
                 print(
@@ -383,9 +410,20 @@ def train(
             val_loss = _run_validation(model, val_loader, loss_fn, device, use_amp=use_amp)
             history["val_losses"].append(val_loss)
             checkpoint_metric = val_loss
+            prev_lr = optimizer.param_groups[0]["lr"]
+            scheduler.step(checkpoint_metric)
+            new_lr = optimizer.param_groups[0]["lr"]
+            if new_lr < prev_lr:
+                print(f"LR reduced: {prev_lr:.2e} -> {new_lr:.2e} (no improvement)")
+            
         else:
             val_loss = None
             checkpoint_metric = train_loss
+            prev_lr = optimizer.param_groups[0]["lr"]
+            scheduler.step(checkpoint_metric)
+            new_lr = optimizer.param_groups[0]["lr"]
+            if new_lr < prev_lr:
+                print(f"LR reduced: {prev_lr:.2e} -> {new_lr:.2e} (no improvement)")
 
         epoch_time = time.perf_counter() - epoch_start
         val_str = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
@@ -401,7 +439,7 @@ def train(
         # already updated above at this point, so a resume's "best so far"
         # comparison baseline is always correct, never one epoch behind.
         save_training_state(
-            model, optimizer, epoch + 1, global_step, best_val_loss, training_state_path, scaler=scaler
+            model, optimizer, epoch + 1, global_step, best_val_loss, training_state_path, scaler=scaler, scheduler=scheduler,
         )
 
         if is_new_best:
@@ -444,6 +482,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-amp", action="store_true",
                          help="Disable mixed-precision (AMP) training even on a CUDA device. "
                               "AMP is auto-enabled on CUDA and auto-disabled on CPU by default.")
+    parser.add_argument("--teacher-forcing-start", type=float, default=DEFAULT_TEACHER_FORCING_START)
+    parser.add_argument("--teacher-forcing-end", type=float, default=DEFAULT_TEACHER_FORCING_END)
+    parser.add_argument("--teacher-forcing-warmup-fraction", type=float, default=DEFAULT_TEACHER_FORCING_WARMUP_FRACTION)
+    parser.add_argument("--lr-scheduler-factor", type=float, default=DEFAULT_LR_SCHEDULER_FACTOR)
+    parser.add_argument("--lr-scheduler-patience", type=int, default=DEFAULT_LR_SCHEDULER_PATIENCE)
+    parser.add_argument("--lr-scheduler-min-lr", type=float, default=DEFAULT_LR_SCHEDULER_MIN_LR)
     return parser
 
 

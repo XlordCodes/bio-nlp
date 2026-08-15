@@ -128,8 +128,27 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_NUM_EPOCHS = 5
 DEFAULT_VAL_FRACTION = 0.1              # held out at the PAIR level, before chunking -- see train.py
 DEFAULT_GRAD_CLIP_NORM = 5.0            # standard safeguard against RNN/LSTM exploding gradients
+
+# Teacher forcing schedule. CHANGED after the first real 5-epoch run: decaying
+# to 0.3 starting from step 0 caused train_loss AND val_loss to rise together
+# from epoch 3 onward (val_loss 0.302 -> 0.454 by epoch 5) -- exposure-bias
+# instability, not overfitting (train_loss rose too, not just val_loss).
+#   1. END raised 0.3 -> 0.6: less reliance on the model's own rough
+#      predictions as training input.
+#   2. WARMUP_FRACTION delays decay start -- the first ~epoch now trains at
+#      full teacher forcing before any decay begins, instead of decaying
+#      from step 0.
 DEFAULT_TEACHER_FORCING_START = 1.0
-DEFAULT_TEACHER_FORCING_END = 0.3
+DEFAULT_TEACHER_FORCING_END = 0.6
+DEFAULT_TEACHER_FORCING_WARMUP_FRACTION = 0.15
+
+# LR scheduler. ADDED for the same reason: a constant LR meant nothing
+# pulled training back once loss started rising -- Adam kept taking
+# full-size steps into a worsening loss landscape for 3 straight epochs.
+# patience=1 is deliberately short given only 5 epochs total.
+DEFAULT_LR_SCHEDULER_FACTOR = 0.5
+DEFAULT_LR_SCHEDULER_PATIENCE = 1
+DEFAULT_LR_SCHEDULER_MIN_LR = 1e-5
 
 # ---------------------------------------------------------------------------
 # Sanity check: this file has no dependencies, so it should always be

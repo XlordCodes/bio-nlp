@@ -227,7 +227,14 @@ class RLEDecoder(nn.Module):
         # in pure inference mode. Kept purely as bookkeeping in training mode
         # (teacher forcing means we always run the full target length anyway).
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-
+        no_repeat_ngram_size = 40 # tokens; tuned to exceed short real tandem repeats
+                            # (E. coli has genuine short repeats -- microsatellites,
+                            # IS elements) while still catching pathological loops
+                            # like the ~62-token cycle observed in eval example 1.
+        if not training_mode:
+            generated_history = [[] for _ in range(B)]
+            ngram_trackers = [dict() for _ in range(B)]  # (n-1)-gram prefix -> banned next-token set
+        
         for t in range(num_steps):
             prev_embed = self.embedding(prev_token)  # (B, embed_dim)
 
@@ -244,10 +251,31 @@ class RLEDecoder(nn.Module):
 
             combined = torch.cat([h_t_for_output, context, rle_context], dim=-1)
             step_logits = self.output_proj(combined)  # (B, vocab_size)
+            if not training_mode and no_repeat_ngram_size > 0:
+                for b in range(B):
+                    if finished[b]:
+                        continue
+                    hist = generated_history[b]
+                    if len(hist) >= no_repeat_ngram_size - 1:
+                        prefix = tuple(hist[-(no_repeat_ngram_size - 1):])
+                        banned = ngram_trackers[b].get(prefix)
+                        if banned:
+                            step_logits[b, list(banned)] = float("-inf")
+
             step_pred = step_logits.argmax(dim=-1)     # (B,)
 
             logits_steps.append(step_logits)
             predicted_steps.append(step_pred)
+            if not training_mode:
+                step_pred_list = step_pred.tolist()  # ONE host sync per step, not B separate .item() calls --
+                                                       # see the teacher_forcing_ratio fix above this file already
+                                                       # made for exactly this class of WSL2/CUDA sync cost
+                for b, tok in enumerate(step_pred_list):
+                    hist = generated_history[b]
+                    hist.append(tok)
+                    if len(hist) >= no_repeat_ngram_size:
+                        prefix = tuple(hist[-no_repeat_ngram_size:-1])
+                        ngram_trackers[b].setdefault(prefix, set()).add(hist[-1])
             alpha_steps.append(alpha)
 
             finished = finished | (step_pred == self.cfg.eos_idx)

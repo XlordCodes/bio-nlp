@@ -51,6 +51,7 @@ def correct_fastq(checkpoint_path: str, input_path: str, output_path: str, devic
     total_bases_in = 0
     total_bases_out = 0
     failed_reads = 0
+    total_chunks_without_eos = 0
     start_time = time.perf_counter()
 
     with open(output_path, "w") as out_f:
@@ -70,9 +71,12 @@ def correct_fastq(checkpoint_path: str, input_path: str, output_path: str, devic
             except Exception as e:
                 print(f"  WARNING: correction failed for read '{header}': {e}")
                 failed_reads += 1
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
 
             corrected = result["corrected_sequence"]
+            total_chunks_without_eos += result["metrics"].get("chunks_without_eos", 0)
             total_bases_in += len(seq)
             total_bases_out += len(corrected)
             out_f.write(f">{header}\n{corrected}\n")
@@ -86,6 +90,7 @@ def correct_fastq(checkpoint_path: str, input_path: str, output_path: str, devic
         "total_bases_out": total_bases_out,
         "elapsed_seconds": elapsed,
         "throughput_mb_per_sec": (total_bases_in / elapsed / 1_000_000) if elapsed > 0 else 0,
+        "total_chunks_without_eos": total_chunks_without_eos
     }
 
     print("\n=== correct_fastq.py summary ===")
